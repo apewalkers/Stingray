@@ -5,7 +5,8 @@ import idaapi
 import ida_bytes
 import idc
 import os
-
+import ida_kernwin
+import ida_funcs
 
 if idaapi.IDA_SDK_VERSION > 700:
    # based on based on https://www.hex-rays.com/products/ida/support/ida74_idapython_no_bc695_porting_guide.shtml
@@ -24,8 +25,8 @@ class ConfigStingray( idaapi.action_handler_t ):
     PLUGIN_COMMENT      = "find strings in current function recursively"
     PLUGIN_HELP         = "www.github.com/darx0r/Stingray"
     PLUGIN_HOTKEY       = "Shift-S"
-    CONFIG_FILE_PATH    = os.path.join( idc.GetIdaDirectory(), 
-                                        "cfg/Stingray.cfg" )
+    CONFIG_FILE_PATH = os.path.join(idaapi.get_user_idadir(), "cfg/Stingray.cfg")
+
 
     CHOOSER_TITLE           = "Stingray - Function Strings"
     CHOOSER_COLUMN_NAMES    = [ "Xref", "Address",  "Type", "String"    ]
@@ -144,84 +145,94 @@ class String( object ):
                 "ULEN4"    ]
 
 
-    def __init__( self, xref, addr ):
-
-        type = idc.GetStringType(addr)
-        if type < 0 or type >= len(String.ASCSTR):
+    def __init__(self, xref, addr):
+        str_type = idc.get_str_type(addr)
+        if str_type is None or str_type >= len(String.ASCSTR):
             raise StringParsingException()
 
         CALC_MAX_LEN = -1
-        string = str( idc.GetString(addr, CALC_MAX_LEN, type) )
+        string = str(idc.get_strlit_contents(addr, CALC_MAX_LEN, str_type), 'utf-8')  # Decode bytes to string
 
         self.xref = xref
         self.addr = addr
-        self.type = type
+        self.type = str_type
         self.string = string
 
 
-    def get_row( self ):
 
-        xref = "{}:{:08X}".format(idc.GetFunctionName(self.xref), self.xref)
+    def get_row(self):
+        xref = "{}:{:08X}".format(ida_funcs.get_func_name(self.xref), self.xref)
         addr = "{:08X}".format(self.addr)
-        type = String.ASCSTR[self.type]
+        str_type = String.ASCSTR[self.type]
         string = self.string
         # IDA Chooser doesn't like tuples ... row should be a list
-        return list( ConfigStingray.CHOOSER_ROW(xref, addr, type, string) )
+        return list(ConfigStingray.CHOOSER_ROW(xref, addr, str_type, string))
 
 
-def find_function_strings( func_ea ):
 
-    end_ea = idc.FindFuncEnd(func_ea)
-    if end_ea == idaapi.BADADDR: return
+def find_function_strings(func_ea):
+    func = ida_funcs.get_func(func_ea)
+    if func is None:
+        raise ValueError(f"No function found at address: {func_ea}")
+
+    start_ea = func.start_ea
+    end_ea = func.end_ea
+
+    if end_ea == idaapi.BADADDR:
+        return []
 
     strings = []
-    for line in idautils.Heads(func_ea, end_ea):
+    for line in idautils.Heads(start_ea, end_ea):
         refs = idautils.DataRefsFrom(line)
         for ref in refs:
             try:
-                strings.append( String(line, ref) )
+                strings.append(String(line, ref))
             except StringParsingException:
                 continue
 
     return strings
 
 
-def find_function_callees( func_ea, maxlvl ):
 
+def find_function_callees(func_ea, maxlvl):
     callees = []
     visited = set()
-    pending = set( (func_ea,) )
+    pending = set((func_ea,))
     lvl = 0
 
-    while len(pending) > 0:
+    while pending:
         func_ea = pending.pop()
         visited.add(func_ea)
 
-        func_name = idc.GetFunctionName(func_ea)
-        if not func_name: continue
+        func_name = ida_funcs.get_func_name(func_ea)
+        if not func_name:
+            continue
         callees.append(func_ea)
 
-        func_end = idc.FindFuncEnd(func_ea)
-        if func_end == idaapi.BADADDR: continue
+        func = ida_funcs.get_func(func_ea)
+        if func is None or func.end_ea == idaapi.BADADDR:
+            continue
+        func_end = func.end_ea
 
-        lvl +=1
-        if lvl >= maxlvl: continue
+        lvl += 1
+        if lvl >= maxlvl:
+            continue
 
         all_refs = set()
-        for line in idautils.Heads(func_ea, func_end):
-
-            if not ida_bytes.isCode(get_flags(line)): continue
+        for line in idautils.Heads(func.start_ea, func_end):
+            if not ida_bytes.is_code(get_flags(line)):
+                continue
 
             ALL_XREFS = 0
             refs = idautils.CodeRefsFrom(line, ALL_XREFS)
-            refs = set( filter( lambda x: not (x >= func_ea and x <= func_end), 
-                                refs) )
+            refs = set(filter(lambda x: not (func.start_ea <= x <= func_end), refs))
             all_refs |= refs
 
         all_refs -= visited
         pending |= all_refs
 
     return callees
+
 
 
 class StringFinder( object ):
@@ -232,8 +243,9 @@ class StringFinder( object ):
 
     def get_current_function_strings( self ):
 
-        addr_in_func = idc.ScreenEA()
-        curr_func = idc.GetFunctionName(addr_in_func)
+        addr_in_func = ida_kernwin.get_screen_ea()
+        curr_func = ida_funcs.get_func_name(addr_in_func)
+
 
         funcs = [ addr_in_func ]
         if ConfigStingray.SEARCH_RECURSION_MAXLVL > 0:
@@ -248,44 +260,28 @@ class StringFinder( object ):
         return total_strs
 
 
-# ------------------------------------------------------------------------------
+from ida_kernwin import Choose
 
+class PluginChooser(Choose):
 
-class PluginChooser( idaapi.Choose2 ):
-
-    def __init__( self, title, columns, items, icon, embedded=False ):
-
-        idaapi.Choose2.__init__(self, title, columns, embedded=embedded)
+    def __init__(self, title, columns, items, icon=0, embedded=False):
+        Choose.__init__(self, title, columns, flags=Choose.CH_MULTI if embedded else 0)
         self.items = items
         self.icon = icon
 
-
-    def GetItems( self ):
-        return self.items
-
-
-    def SetItems( self, items ):
-        self.items = [] if items is None else items
-        self.Refresh()
-
-
-    def OnClose( self ):
+    def OnClose(self):
         pass
 
-
-    def OnGetLine( self, n ):
+    def OnGetLine(self, n):
         return self.items[n]
 
-
-    def OnGetSize( self ):
+    def OnGetSize(self):
         return len(self.items)
 
-
-    def OnSelectLine( self, n ):
-
-        row = ConfigStingray.CHOOSER_ROW( *self.items[n] )
+    def OnSelectLine(self, n):
+        row = ConfigStingray.CHOOSER_ROW(*self.items[n])
         xref = row.Xref.split(':')[-1]
-        idc.Jump( int(xref, 16) )
+        idc.jumpto(int(xref, 16))  # Updated from `idc.Jump` to `idc.jumpto`, which is the preferred function in newer APIs.
 
 
 # ------------------------------------------------------------------------------    
@@ -304,18 +300,26 @@ class StingrayPlugin( idaapi.plugin_t ):
         self._chooser = None
 
 
-    def init( self ):
+    def init(self):
+        try:
+            # Attempt to load the custom icon
+            self.icon_id = idaapi.load_custom_icon(data=ConfigStingray.PLUGIN_ICON_PNG, format="png")
+            if self.icon_id == 0:
+                # If load_custom_icon fails, raise an exception to handle it in the `except` block
+                raise RuntimeError("Failed to load icon data!")
+        except Exception as e:
+            # Handle the error gracefully
+            print(f"Warning: {e}")
+            print("Falling back to default icon.")
+            self.icon_id = -1  # Use a default value or built-in icon ID
 
-        self.icon_id = idaapi.load_custom_icon( data = ConfigStingray.PLUGIN_ICON_PNG, 
-                                                format = "png"    )
-        if self.icon_id == 0:
-            raise RuntimeError("Failed to load icon data!")
-
+        # Initialize the rest of the plugin components
         self.finder = StringFinder()
-
         ConfigStingray.init()
 
+        # Keep the plugin active
         return idaapi.PLUGIN_KEEP
+
 
 
     def run( self, arg=0 ):
@@ -354,7 +358,7 @@ def PLUGIN_ENTRY():
 
 
 if ConfigStingray.PLUGIN_TEST:
-    print "{} - test".format(ConfigStingray.PLUGIN_NAME)
+    print("{} - test".format(ConfigStingray.PLUGIN_NAME))
     p = StingrayPlugin()
     p.init()
     p.run()
